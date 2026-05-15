@@ -1,0 +1,118 @@
+name: Update formula on release
+
+on:
+  repository_dispatch:
+    types: [captionqueue_release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.1)"
+        required: true
+      sdist_url:
+        description: "PyPI sdist URL"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  update-formula:
+    name: Update Formula/captionqueue.rb to ${{ github.event.client_payload.version || inputs.version }}
+    runs-on: macos-14
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          DISPATCH_SDIST_URL: ${{ github.event.client_payload.sdist_url }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SDIST_URL: ${{ inputs.sdist_url }}
+        run: |
+          set -euo pipefail
+          version="${DISPATCH_VERSION:-$INPUT_VERSION}"
+          sdist_url="${DISPATCH_SDIST_URL:-$INPUT_SDIST_URL}"
+          if [ -z "$version" ] || [ -z "$sdist_url" ]; then
+            echo "Missing version or sdist_url in dispatch payload / inputs."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sdist_url=$sdist_url" >> "$GITHUB_OUTPUT"
+
+      - name: Download sdist and compute SHA-256
+        id: hash
+        env:
+          SDIST_URL: ${{ steps.meta.outputs.sdist_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/captionqueue-release
+          curl --fail --show-error --silent --location \
+            -o /tmp/captionqueue-release/sdist.tar.gz "$SDIST_URL"
+          sha=$(shasum -a 256 /tmp/captionqueue-release/sdist.tar.gz | awk '{print $1}')
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Render formula scaffold
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SDIST_URL: ${{ steps.meta.outputs.sdist_url }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          url = os.environ["SDIST_URL"]
+          sha = os.environ["SHA256"]
+          formula = Path("Formula/captionqueue.rb")
+          text = formula.read_text(encoding="utf-8")
+
+          def replace_line(lines, prefix, new_line):
+              for idx, line in enumerate(lines):
+                  if line.lstrip().startswith(prefix):
+                      indent = line[: len(line) - len(line.lstrip())]
+                      lines[idx] = f"{indent}{new_line}"
+                      return
+              raise SystemExit(f"Could not find line starting with {prefix!r} in formula")
+
+          lines = text.splitlines()
+          replace_line(lines, "url ",     f'url "{url}"')
+          replace_line(lines, "sha256 ",  f'sha256 "{sha}"')
+          replace_line(lines, "version ", f'version "{version}"')
+          formula.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Refresh Python resources from PyPI
+        run: |
+          set -euo pipefail
+          brew update --quiet
+          # `brew update-python-resources` walks the formula's PyPI sdist and
+          # regenerates every `resource` block from the upstream wheel metadata.
+          brew update-python-resources Formula/captionqueue.rb
+
+      - name: Audit formula
+        run: brew audit --strict --online Formula/captionqueue.rb
+
+      - name: Install formula from source (smoke test)
+        run: |
+          set -euo pipefail
+          brew install --build-from-source --verbose ./Formula/captionqueue.rb
+          brew test ./Formula/captionqueue.rb
+
+      - name: Commit updated formula
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet Formula/captionqueue.rb; then
+            echo "Formula already up to date at $VERSION; nothing to commit."
+            exit 0
+          fi
+          git add Formula/captionqueue.rb
+          git commit -m "captionqueue $VERSION"
+          git push origin HEAD
